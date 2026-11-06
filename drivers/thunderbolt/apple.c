@@ -328,6 +328,7 @@ struct apple_cio {
 		struct apple_dpin_state state;
 		struct apple_dpin_tokens tokens;
 		struct apple_dpin_binding *binding; /* worker-owned, handed to DCP */
+		unsigned long handed_at; /* jiffies of the last handoff, worker-owned */
 	} dpin[2];
 };
 
@@ -362,6 +363,64 @@ struct apple_dpin_binding {
 static bool dp_display = true;
 module_param(dp_display, bool, 0444);
 MODULE_PARM_DESC(dp_display, "Drive displays behind qualified Thunderbolt DP tunnels (default: true)");
+
+/*
+ * On t600x one tunnel pixel clock selector serves PCLK1, PCLK2 and DPRX of a
+ * port (atc_tunnel_start_t8103()), so bringing up the second DP IN adapter
+ * reprograms the clock the first stream is still training on. A dock that
+ * raises both HPDs at once (seen at boot with a USB4 dock, about 2 s apart)
+ * then loses the first link and DCP's DPTX calls for the second time out,
+ * which can take the whole USB4 link down. Hold the second adapter's handoff
+ * back until the first has had time to train.
+ */
+static int dpin_stagger_ms = -1;
+module_param(dpin_stagger_ms, int, 0644);
+MODULE_PARM_DESC(dpin_stagger_ms,
+		 "Minimum time (ms) between handing the two DP IN adapters of a port to the display driver; -1 = 4000 on t600x, 0 elsewhere (default: -1)");
+
+#define APPLE_DPIN_STAGGER_T600X_MS	4000
+
+static unsigned int apple_dpin_stagger_ms(void)
+{
+	int ms = READ_ONCE(dpin_stagger_ms);
+
+	if (ms >= 0)
+		return min(ms, 30000);
+	if (of_machine_is_compatible("apple,t6000") ||
+	    of_machine_is_compatible("apple,t6001") ||
+	    of_machine_is_compatible("apple,t6002"))
+		return APPLE_DPIN_STAGGER_T600X_MS;
+	return 0;
+}
+
+/*
+ * Wait until the other adapter of this port has been handed over for at
+ * least the stagger time. Runs on the ordered DP queue, so the other
+ * adapter's worker is not running: only its handoff time is read. A request
+ * that goes stale while sleeping is caught by apple_dpin_up().
+ */
+static void apple_dpin_stagger(struct apple_dpin_ctx *c)
+{
+	struct apple_dpin_ctx *other = &c->acio->dpin[c->idx ^ 1];
+	unsigned int ms = apple_dpin_stagger_ms();
+	unsigned long handed_at, until;
+	bool handed;
+
+	if (!ms)
+		return;
+	scoped_guard(mutex, &other->lock) {
+		handed = other->binding && other->state.alive;
+		handed_at = other->handed_at;
+	}
+	if (!handed)
+		return;
+	until = handed_at + msecs_to_jiffies(ms);
+	if (time_after_eq(jiffies, until))
+		return;
+	dev_info(c->acio->dev, "dpin%u: waiting %u ms for dpin%u's link to settle\n",
+		 c->idx, jiffies_to_msecs(until - jiffies), other->idx);
+	msleep(jiffies_to_msecs(until - jiffies));
+}
 
 /*
  * The M1 Pro/Max ATC is the t8103 generation: same DP IN adapter registers,
@@ -768,6 +827,7 @@ static void apple_dpin_work_fn(struct work_struct *work)
 		if (!(actions & APPLE_DPIN_ATTACH))
 			return;
 
+		apple_dpin_stagger(c);
 		binding = kzalloc_obj(*binding);
 		deferred = false;
 		if (binding) {
@@ -782,8 +842,10 @@ static void apple_dpin_work_fn(struct work_struct *work)
 			stale = !c->state.alive || c->tokens.requested != generation;
 			if (!ret) {
 				stale |= !apple_dpin_token_complete(&c->tokens, generation);
-				if (!stale)
+				if (!stale) {
 					c->binding = binding;
+					c->handed_at = jiffies;
+				}
 			} else {
 				apple_dpin_token_revoke(&c->tokens, generation);
 			}
